@@ -11,8 +11,8 @@ class MTGNNExplainer:
     MTGNN Explainer for explaining single-step predictions with timestamp-specific adjacency support.
     
     This explainer learns:
-    1. Adjacency masks: Importance masks for graph edges per timestamp (num_nodes, num_nodes, seq_length)
-       These are truly timestamp-specific when used with gtnet_timestamp model
+    1. Adjacency masks: Importance masks for graph edges with 5 shared masks across timestamp groups (num_nodes, num_nodes, 5)
+       Each mask is shared across seq_length/5 timestamps, reducing complexity while maintaining temporal patterns
     2. Feature masks: Importance masks per timestamp (batch, channels, nodes, timesteps)
        These are truly timestamp-specific
     
@@ -24,7 +24,7 @@ class MTGNNExplainer:
     """
     
     def __init__(self, model: nn.Module, epochs: int = 100, lr: float = 0.01, 
-                 device: str = 'cpu', mask_features: bool = True, **kwargs):
+                 device: str = 'cpu', mask_features: bool = True, num_mask_groups: int = 5, **kwargs):
         """
         Initialize MTGNN Explainer.
         
@@ -34,6 +34,8 @@ class MTGNNExplainer:
             lr: Learning rate for mask optimization
             device: Device to run on
             mask_features: Whether to apply feature masks (True) or only adjacency masks (False)
+            num_mask_groups: Number of mask groups to share across timestamps (int). Values outside [1, seq_length]
+                              are treated as invalid and we fall back to per-timestamp masks.
             **kwargs: Additional hyper-parameters for regularization coefficients
         """
         self.model = model
@@ -41,6 +43,7 @@ class MTGNNExplainer:
         self.lr = lr
         self.device = device
         self.mask_features = mask_features  # Option to mask features or not
+        self.num_mask_groups = num_mask_groups  # Number of mask groups (validated per input by _effective_num_mask_groups)
         
         # Regularization coefficients
         self.coeffs = {
@@ -60,7 +63,7 @@ class MTGNNExplainer:
         # Move model to device and set to eval mode
         self.model.to(device)
         self.model.eval()
-        
+
     def explain(self, input_tensor: torch.Tensor, target_node: Optional[int] = None,
                 target_timestep: int = 0, idx: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
@@ -143,16 +146,31 @@ class MTGNNExplainer:
         return explanation
     
     def _init_adjacency_masks(self, num_nodes: int, seq_length: int) -> torch.Tensor:
-        """Initialize adjacency masks for graph edges per timestamp."""
-        # Initialize with random values
-        masks = torch.randn(num_nodes, num_nodes, seq_length, device=self.device)
+        """Initialize adjacency masks for graph edges."""
+        if not (0 < self.num_mask_groups < seq_length):
+            # Per-timestamp masks (original behavior)
+            masks = torch.randn(num_nodes, num_nodes, seq_length, device=self.device)
+        else:
+            # Shared masks across timestamp groups
+            masks = torch.randn(num_nodes, num_nodes, self.num_mask_groups, device=self.device)
         masks.requires_grad_(True)
         return masks
     
     def _init_feature_masks(self, input_shape: Tuple[int, ...]) -> torch.Tensor:
-        """Initialize feature masks matching input tensor shape."""
-        # Initialize with random values
-        masks = torch.randn(input_shape, device=self.device)
+        """Initialize feature masks with optional grouping strategy.
+
+        Note: `num_mask_groups` is always an int; values outside [1, seq_length]
+        are treated as invalid and we fall back to per-timestamp masks.
+        """
+        batch_size, channels, num_nodes, seq_length = input_shape
+        
+        if not (0 < self.num_mask_groups < seq_length):
+            # Per-timestamp feature masks (original behavior)
+            masks = torch.randn(input_shape, device=self.device)
+        else:
+            # Grouped feature masks - create masks for each group
+            masks = torch.randn(batch_size, channels, num_nodes, self.num_mask_groups, device=self.device)
+        
         masks.requires_grad_(True)
         return masks
     
@@ -201,7 +219,8 @@ class MTGNNExplainer:
             # Collect hard masks from gradients (inspired by PyG GNNExplainer)
             if epoch == 0:
                 hard_adjacency_mask = self._get_hard_mask(adjacency_masks)
-                hard_feature_mask = self._get_hard_mask(feature_masks)
+                if self.mask_features:
+                    hard_feature_mask = self._get_hard_mask(feature_masks)
             
             optimizer.step()
             
@@ -209,7 +228,7 @@ class MTGNNExplainer:
             self._restore_adjacency()
             
             if epoch % 20 == 0:
-                print(f"Epoch {epoch}, Loss: {loss.item():.4f}, Pred Diff: {pred_diff.item():.4f}")
+                print(f"Epoch {epoch}, Loss: {loss.item():.4f}, Pred Diff: {pred_diff.item():.4f}", flush=True)
         
         # Apply hard masks: set invalid (unused) elements to -inf for sigmoid
         # hard_mask: True = valid (keep value), False = invalid (set to -inf)
@@ -252,27 +271,48 @@ class MTGNNExplainer:
         
         # Apply feature masks conditionally
         if self.mask_features:
-            masked_input = input_tensor * F.sigmoid(feature_masks)
+            if not (0 < self.num_mask_groups < seq_length):
+                # Per-timestamp feature masks (original behavior)
+                masked_input = input_tensor * F.sigmoid(feature_masks)
+            else:
+                # Grouped feature masks - expand to per-timestamp
+                timestamps_per_group = seq_length // self.num_mask_groups
+                feature_masks_expanded = torch.zeros_like(input_tensor)
+                for t in range(seq_length):
+                    mask_group_idx = min(t // timestamps_per_group, self.num_mask_groups - 1)
+                    feature_masks_expanded[:, :, :, t] = feature_masks[:, :, :, mask_group_idx]
+                masked_input = input_tensor * F.sigmoid(feature_masks_expanded)
         else:
             masked_input = input_tensor  # No feature masking
         
         # Apply timestamp-specific masks to the stored adjacency matrix
         # For original models, adp is a single adjacency matrix
         if self.model.gcn_true and self.adp is not None:
-            # Create timestamp-specific adjacency matrices independently per timestep
-            # adjacency_masks shape: (num_nodes, num_nodes, seq_length)
-            # self.adp shape: (num_nodes, num_nodes)
-            
-            sigmoid_adjacency_masks = F.sigmoid(adjacency_masks)  # (num_nodes, num_nodes, seq_length)
+            sigmoid_adjacency_masks = F.sigmoid(adjacency_masks)
             
             # Create timestamp-specific adjacency matrices
             timestamp_adj_matrices = []
-            for t in range(seq_length):
-                # Get adjacency mask for timestep t
-                adj_mask_t = sigmoid_adjacency_masks[:, :, t]  # (num_nodes, num_nodes)
-                # Apply mask to original adjacency matrix
-                masked_adp_t = self.adp * adj_mask_t
-                timestamp_adj_matrices.append(masked_adp_t)
+            
+            if not (0 < self.num_mask_groups < seq_length):
+                # Per-timestamp masks (original behavior)
+                # adjacency_masks shape: (num_nodes, num_nodes, seq_length)
+                for t in range(seq_length):
+                    adj_mask_t = sigmoid_adjacency_masks[:, :, t]  # (num_nodes, num_nodes)
+                    masked_adp_t = self.adp * adj_mask_t
+                    timestamp_adj_matrices.append(masked_adp_t)
+            else:
+                # Shared masks across timestamp groups
+                # adjacency_masks shape: (num_nodes, num_nodes, num_mask_groups)
+                timestamps_per_group = seq_length // self.num_mask_groups
+                
+                for t in range(seq_length):
+                    # Determine which mask group this timestamp belongs to
+                    mask_group_idx = min(t // timestamps_per_group, self.num_mask_groups - 1)
+                    # Get adjacency mask for this timestamp group
+                    adj_mask_t = sigmoid_adjacency_masks[:, :, mask_group_idx]  # (num_nodes, num_nodes)
+                    # Apply mask to original adjacency matrix
+                    masked_adp_t = self.adp * adj_mask_t
+                    timestamp_adj_matrices.append(masked_adp_t)
             
             # Stack to create tensor of shape (seq_length, num_nodes, num_nodes)
             timestamp_adj_matrices = torch.stack(timestamp_adj_matrices, dim=0)
@@ -304,39 +344,179 @@ class MTGNNExplainer:
         feature_masks = explanation['feature_masks']
         
         # Apply sigmoid to get actual importance scores (keep as tensors)
-        adjacency_importance = torch.sigmoid(adjacency_masks)  # (num_nodes, num_nodes, seq_length)
+        adjacency_importance = torch.sigmoid(adjacency_masks)  # (num_nodes, num_nodes, 5)
         feature_importance = torch.sigmoid(feature_masks)
         
-        # Adjacency importance per timestamp
-        adjacency_importance_per_timestep = adjacency_importance  # (num_nodes, num_nodes, seq_length)
+        # Get seq_length from feature_masks shape (always 4D: batch, channels, nodes, timesteps)
+        batch_size, channels, num_nodes, seq_length = feature_masks.shape
         
         # Overall adjacency importance (average across timesteps)
         overall_adjacency_importance = torch.mean(adjacency_importance, dim=2)  # (num_nodes, num_nodes)
         
-        # Overall node importance (sum of incoming/outgoing edges)
-        incoming_importance = torch.sum(overall_adjacency_importance, dim=0)  # (num_nodes,)
-        outgoing_importance = torch.sum(overall_adjacency_importance, dim=1)  # (num_nodes,)
+        # Overall node importance (mean of incoming/outgoing edges)
+        incoming_importance = torch.mean(overall_adjacency_importance, dim=0)  # (num_nodes,)
+        outgoing_importance = torch.mean(overall_adjacency_importance, dim=1)  # (num_nodes,)
         overall_node_importance = (incoming_importance + outgoing_importance) / 2
         
-        # Feature importance per timestamp
-        if len(feature_importance.shape) == 4:  # (batch, channels, nodes, timesteps)
-            feature_importance_per_timestep = torch.mean(feature_importance, dim=(0, 2))  # (channels, timesteps)
-            overall_feature_importance = torch.mean(feature_importance, dim=(0, 2, 3))  # (channels,)
-        else:
-            feature_importance_per_timestep = torch.mean(feature_importance, dim=(0, 1, 2))  # (timesteps,)
-            overall_feature_importance = torch.mean(feature_importance, dim=(0, 1, 2))  # (channels,)
+        # Feature importance per group (unified handling)
+        feature_importance_per_group = torch.mean(feature_importance, dim=(0, 2))  # (channels, timesteps)
+        overall_feature_importance = torch.mean(feature_importance, dim=(0, 2, 3))  # (channels,)
         
         return {
-            'adjacency_importance_per_timestep': adjacency_importance_per_timestep,
+            'adjacency_importance_per_group': adjacency_importance,
             'overall_adjacency_importance': overall_adjacency_importance,
             'incoming_importance': incoming_importance,
             'outgoing_importance': outgoing_importance,
             'overall_node_importance': overall_node_importance,
-            'feature_importance_per_timestep': feature_importance_per_timestep,
+            'feature_importance_per_group': feature_importance_per_group,
             'overall_feature_importance': overall_feature_importance,
             'adjacency_importance': adjacency_importance,
             'feature_importance': feature_importance
         }
+    
+    def get_fidelity_sparsity_curve(self, input_tensor: torch.Tensor, explanation: Dict[str, torch.Tensor],
+                                  sparsity_range: tuple = (0.5, 0.9), num_points: int = 10,
+                                  idx: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        Calculate fidelity-sparsity curve by varying sparsity levels.
+        
+        Args:
+            input_tensor: Original input tensor used for the explanation
+            explanation: Explanation dict returned by explain() (uses its importance and prediction)
+            sparsity_range: Tuple of (min_sparsity, max_sparsity) 
+            num_points: Number of sparsity points to evaluate
+            idx: Optional node indices
+            
+        Returns:
+            Dictionary with sparsity levels and corresponding metrics (mae, rmse, mape)
+        """
+        import torch.nn.functional as F
+        
+        # Use importance scores from provided explanation (no new explanation run)
+        adjacency_importance = explanation['adjacency_importance']  # (num_nodes, num_nodes, groups/timestamps)
+        feature_importance = None  # no feature sparsity
+        target_pred = explanation['prediction']
+        
+        # Generate sparsity levels
+        sparsity_levels = torch.linspace(sparsity_range[0], sparsity_range[1], num_points)
+        maes: list[torch.Tensor] = []
+        rmses: list[torch.Tensor] = []
+        mapes: list[torch.Tensor] = []
+        
+        # Count actual edges for reference
+        if self.adp is not None:
+            num_actual_edges = (self.adp > 0).sum().item()
+            print(f"Total actual edges in adjacency matrix: {num_actual_edges}")
+        
+        for sparsity in sparsity_levels:
+            # Create hard masks based on sparsity (adjacency only)
+            masked_input, timestamp_adj_matrices = self._apply_sparsity_mask(
+                input_tensor, adjacency_importance, sparsity.item()
+            )
+            
+            # Get prediction with sparsity mask
+            with torch.no_grad():
+                if timestamp_adj_matrices is not None:
+                    masked_pred = self.model(masked_input, idx=idx, timestamp_adj_matrices=timestamp_adj_matrices)
+                else:
+                    masked_pred = self.model(masked_input, idx=idx)
+            
+            # Metrics: MAE, RMSE, MAPE
+            diff = masked_pred - target_pred
+            abs_diff = torch.abs(diff)
+            mae = abs_diff.mean()
+            rmse = torch.sqrt((diff ** 2).mean())
+            # Avoid division by zero using EPS
+            mape = (abs_diff / (torch.abs(target_pred) + self.coeffs['EPS'])).mean()
+            maes.append(mae)
+            rmses.append(rmse)
+            mapes.append(mape)
+        
+        return {
+            'sparsity_levels': sparsity_levels,
+            'mae': torch.stack(maes),
+            'rmse': torch.stack(rmses),
+            'mape': torch.stack(mapes)
+        }
+    
+    def _apply_sparsity_mask(self, input_tensor: torch.Tensor, adjacency_importance: torch.Tensor,
+                            sparsity: float) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Apply sparsity mask by keeping only top (1-sparsity) fraction of important adjacency edges.
+        Features are not masked - adjacency-only.
+        
+        Args:
+            input_tensor: Input tensor
+            adjacency_importance: Adjacency importance scores
+            sparsity: Fraction of edges to remove (0.5 = remove 50%)
+            
+        Returns:
+            Tuple of (masked input tensor, timestamp adjacency matrices)
+        """
+        
+        batch_size, channels, num_nodes, seq_length = input_tensor.shape
+        masked_input = input_tensor.clone()
+        
+        # Skip feature sparsity mask - only apply to adjacency matrix
+        
+        # Apply adjacency sparsity mask
+        if self.adp is not None:
+            # Create timestamp-specific adjacency matrices with sparsity
+            timestamp_adj_matrices = []
+            
+            if not (0 < self.num_mask_groups < seq_length):
+                # Per-timestamp: adjacency_importance shape (num_nodes, num_nodes, timesteps)
+                edge_mask = (self.adp > 0)
+                num_actual_edges = edge_mask.sum().item()
+                edge_indices = torch.where(edge_mask)
+                for t in range(seq_length):
+                    adj_imp_t = adjacency_importance[:, :, t]  # (num_nodes, num_nodes)
+                    num_keep = int((1 - sparsity) * num_actual_edges)
+                    if num_keep > 0:
+                        # Only consider edges that exist in the original adjacency matrix
+                        edge_importance = adj_imp_t[edge_mask]
+                        _, top_indices = torch.topk(edge_importance, num_keep)
+                        
+                        # Create mask for actual edges
+                        mask = torch.zeros_like(self.adp, device=self.adp.device)
+                        selected_edge_indices = (edge_indices[0][top_indices], edge_indices[1][top_indices])
+                        mask[selected_edge_indices] = 1.0
+                        masked_adj = self.adp * mask
+                    else:
+                        masked_adj = torch.zeros_like(self.adp)
+                    timestamp_adj_matrices.append(masked_adj)
+            else:
+                # Grouped: adjacency_importance shape (num_nodes, num_nodes, groups)
+                timestamps_per_group = seq_length // self.num_mask_groups
+                # Precompute one masked adjacency per group and reuse across timestamps
+                masked_adj_per_group = []
+                edge_mask = (self.adp > 0)
+                num_actual_edges = edge_mask.sum().item()
+                edge_indices = torch.where(edge_mask)
+                for g in range(self.num_mask_groups):
+                    adj_imp_g = adjacency_importance[:, :, g]  # (num_nodes, num_nodes)
+                    num_keep = int((1 - sparsity) * num_actual_edges)
+                    if num_keep > 0:
+                        edge_importance = adj_imp_g[edge_mask]
+                        _, top_indices = torch.topk(edge_importance, num_keep)
+                        mask = torch.zeros_like(self.adp, device=self.adp.device)
+                        selected_edge_indices = (edge_indices[0][top_indices], edge_indices[1][top_indices])
+                        mask[selected_edge_indices] = 1.0
+                        masked_adj = self.adp * mask
+                    else:
+                        masked_adj = torch.zeros_like(self.adp)
+                    masked_adj_per_group.append(masked_adj)
+                for t in range(seq_length):
+                    group_idx = min(t // timestamps_per_group, self.num_mask_groups - 1)
+                    timestamp_adj_matrices.append(masked_adj_per_group[group_idx])
+            
+            # Stack to create tensor of shape (seq_length, num_nodes, num_nodes)
+            timestamp_adj_matrices = torch.stack(timestamp_adj_matrices, dim=0)
+        else:
+            timestamp_adj_matrices = None
+        
+        # Ensure masked input is on the same device as the model
+        return masked_input.to(self.device), timestamp_adj_matrices
     
     def visualize_importance(self, importance_scores: Dict[str, Union[torch.Tensor, np.ndarray]], 
                            explanation: Optional[Dict[str, torch.Tensor]] = None,

@@ -72,7 +72,7 @@ def run_explainer_example(model_path: str = None, data_path: str = None,
                           target_node: int = None, epochs: int = 100,
                           device: str = 'cpu', save_results: bool = True,
                           model_config: argparse.Namespace = None,
-                          mask_features: bool = True):
+                          mask_features: bool = True, num_mask_groups: int = 5):
     """
     Run MTGNN Explainer example.
     
@@ -85,6 +85,8 @@ def run_explainer_example(model_path: str = None, data_path: str = None,
         epochs: Number of epochs for mask optimization
         device: Device to run on
         save_results: Whether to save results and plots
+        mask_features: Whether to apply feature masks
+        num_mask_groups: Number of mask groups (None for per-timestamp masks)
     """
     
     print("=" * 60)
@@ -198,6 +200,7 @@ def run_explainer_example(model_path: str = None, data_path: str = None,
         lr=model_config.lr if model_config is not None else 0.01,
         device=device,
         mask_features=mask_features,
+        num_mask_groups=num_mask_groups,
         **explainer_coeffs
     )
     
@@ -252,6 +255,28 @@ def run_explainer_example(model_path: str = None, data_path: str = None,
     print(f"  Std:  {pred_diff.std().item():.4f}")
     print(f"  Max:  {pred_diff.max().item():.4f}")
     print(f"  Min:  {pred_diff.min().item():.4f}")
+    
+    # Calculate sparsity curve with MAE/RMSE/MAPE (always run)
+    print("\nEvaluating sparsity curve (MAE/RMSE/MAPE)...")
+    try:
+        curve_data = explainer.get_fidelity_sparsity_curve(
+            input_data, explanation,
+            sparsity_range=(0.5, 0.9), 
+            num_points=5
+        )
+        
+        print("Sparsity\tMAE\t\tRMSE\t\tMAPE")
+        print("-" * 40)
+        for i in range(len(curve_data['sparsity_levels'])):
+            sparsity = curve_data['sparsity_levels'][i].item()
+            mae = curve_data['mae'][i].item()
+            rmse = curve_data['rmse'][i].item()
+            mape = curve_data['mape'][i].item()
+            print(f"{sparsity:.2f}\t\t{mae:.4f}\t\t{rmse:.4f}\t\t{mape:.4f}")
+    except Exception as e:
+        print(f"Error in sparsity curve: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Visualize results
     if save_results:
@@ -353,6 +378,8 @@ def main():
                        help='Save results and plots')
     parser.add_argument('--mask_features', action='store_true', default=True,
                        help='Whether to apply feature masks (True) or only adjacency masks (False)')
+    parser.add_argument('--num_mask_groups', type=int, default=5,
+                       help='Number of mask groups to share across timestamps')
     
     args = parser.parse_args()
     
@@ -373,7 +400,8 @@ def main():
             device=args.device,
             save_results=args.save_results,
             model_config=args,
-            mask_features=args.mask_features
+            mask_features=args.mask_features,
+            num_mask_groups=args.num_mask_groups
         )
         
         print("\n" + "=" * 60)
